@@ -153,7 +153,22 @@ jobs:
           /usr/bin/ditto -c -k --norsrc --noextattr --keepParent \
             "$PWD/out/Payload" "$PWD/out/TurboIO-iOS-V2-unsigned.ipa"
           shasum -a 256 "$PWD/out/TurboIO-iOS-V2-unsigned.ipa" | tee "$PWD/out/SHA256.txt"
+          # 顺便准备一个小体积的 sideload kit（dylib + 补丁后的 plist），
+          # 方便在 Windows 上对既有 IPA 做原位替换，避免重复下载 336MB 大包
+          mkdir -p kit
+          cp "$ADDON" kit/TurboIOPrivateAddon.dylib
+          cp out/Payload/Runner.app/Info.plist kit/Info.plist
+          shasum -a 256 kit/* | tee kit/SHA256.txt
           echo "::notice::未签名 IPA 已生成。回 Windows 后用爱思助手 / AltServer 以你的 Apple ID 签名安装（免费账号 7 天有效期）。"
+
+      - name: Upload sideload kit (dylib + patched Info.plist)
+        if: ${{ inputs.sign_mode == 'unsigned' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: TurboIO-sideload-kit-${{ inputs.variant }}
+          path: kit/
+          if-no-files-found: error
+          retention-days: 14
 
       # ------------------------------------------------- 3b. signed：CI 内用付费证书签
       - name: Import signing identity
