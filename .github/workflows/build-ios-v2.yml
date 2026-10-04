@@ -38,6 +38,11 @@ on:
         description: '仅 signed 模式需要：iPhone UDID（爱思助手设备信息里可查）'
         required: false
         type: string
+      bundle_id:
+        description: '自定义 Bundle ID（免费账号注册不了 com.rayneo.venus.pub 时换一个没人占用的）'
+        required: false
+        default: io.turboio.venus.pub
+        type: string
       runner:
         description: 'macOS runner；若报 deployment target 不支持，改 macos-15 / macos-14 再试'
         required: false
@@ -60,7 +65,7 @@ jobs:
       # 作者提供的原厂砸壳 IPA（只有解密，没有合并任何 Turbo IO 扩展）
       HOST_IPA_URL: https://github.com/Turbo1123/Turbo-IO/releases/download/rayneo-ios-1.0.5-201/RayNeo_AI_1.0.5_201_decrypted_original.ipa
       HOST_IPA_SHA256: 39d12aff8f2b312dc3b40ce784a444e52c536e61378434005255177548df966a
-      BUNDLE_ID: com.rayneo.venus.pub
+      BUNDLE_ID: ${{ inputs.bundle_id }}
 
     steps:
       - name: Checkout
@@ -122,6 +127,29 @@ jobs:
             "$PWD/out/Payload/Runner.app" \
             "$ADDON" \
             "$BUNDLE_ID"
+          # macho-embed 已把 CFBundleIdentifier 改成 $BUNDLE_ID。
+          # 再做两个 sideload 兼容补丁：
+          #   1) 删 UISupportedDevices 机型白名单（iPhone 17 等新机型不在官方名单里，会报
+          #      DeviceNotSupportedByThinning 拒装）
+          #   2) UIBackgroundModes 去掉 remote-notification（免费账号没有 aps-environment 权限）
+          python3 - <<'PY'
+          import plistlib, os
+          p = os.path.join(os.environ['GITHUB_WORKSPACE'], 'out', 'Payload', 'Runner.app', 'Info.plist')
+          with open(p, 'rb') as f:
+              d = plistlib.load(f)
+          removed_devices = d.pop('UISupportedDevices', None)
+          bm = d.get('UIBackgroundModes')
+          dropped_push = False
+          if bm and 'remote-notification' in bm:
+              bm.remove('remote-notification')
+              dropped_push = True
+          with open(p, 'wb') as f:
+              plistlib.dump(d, f)
+          print('bundle id   =', d['CFBundleIdentifier'])
+          print('devices     =', 'removed (%d entries)' % len(removed_devices) if removed_devices else 'not present')
+          print('push mode   =', 'removed' if dropped_push else 'not present')
+          print('bg modes    =', d.get('UIBackgroundModes'))
+          PY
           /usr/bin/ditto -c -k --norsrc --noextattr --keepParent \
             "$PWD/out/Payload" "$PWD/out/TurboIO-iOS-V2-unsigned.ipa"
           shasum -a 256 "$PWD/out/TurboIO-iOS-V2-unsigned.ipa" | tee "$PWD/out/SHA256.txt"
