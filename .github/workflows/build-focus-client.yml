@@ -86,7 +86,7 @@ jobs:
           b=build.read_text(encoding='utf-8')
           needle='TDPhoneStore.m TDPhoneRun.m'
           assert b.count(needle)==1
-          b=b.replace(needle,'DisplayDiagnostics.m nav_runtime.c NativeNavigation.m TNVTransport.m NativeNavigationUI.m '+needle)
+          b=b.replace(needle,'DisplayDiagnostics.m display_carrier.c display_runtime.c nav_runtime.c NativeNavigation.m TNVTransport.m NativeNavigationUI.m '+needle)
           build.write_text(b,encoding='utf-8')
           print('Applied bounded startup retries and visible diagnostic entry; preserved ABI and bundle gates.')
           TIO_HELPER_EOF
