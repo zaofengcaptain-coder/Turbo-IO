@@ -82,6 +82,12 @@ jobs:
           assert s.count(needle)==1
           s=s.replace(needle,needle+'\n            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,5*NSEC_PER_SEC),dispatch_get_main_queue(),^{AddEntry();});\n            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,10*NSEC_PER_SEC),dispatch_get_main_queue(),^{AddEntry();});')
           p.write_text(s,encoding='utf-8')
+          build=p.with_name('build.sh')
+          b=build.read_text(encoding='utf-8')
+          needle='TDPhoneStore.m TDPhoneRun.m'
+          assert b.count(needle)==1
+          b=b.replace(needle,'DisplayDiagnostics.m nav_runtime.c NativeNavigation.m TNVTransport.m NativeNavigationUI.m '+needle)
+          build.write_text(b,encoding='utf-8')
           print('Applied bounded startup retries and visible diagnostic entry; preserved ABI and bundle gates.')
           TIO_HELPER_EOF
           cat > control/audit_ipa.py <<'TIO_HELPER_EOF'
