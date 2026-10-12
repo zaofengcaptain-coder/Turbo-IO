@@ -1,0 +1,218 @@
+name: TurboIO FOCUS client build
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/build-focus-client.yml']
+  workflow_dispatch:
+    inputs:
+      bundle_id:
+        description: 'Exact Bundle ID to keep when signing'
+        required: true
+        default: io.turboio.venus.pub
+        type: string
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      BUNDLE_ID: ${{ inputs.bundle_id || 'io.turboio.venus.pub' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: Turbo1123/Turbo-IO
+          ref: c8815c0b2ff9db3bcdaeeb75abb3ca0e42251efb
+          path: source
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Prepare local build helpers
+        run: |
+          mkdir -p control
+          cat > control/patch_focus_diagnostics.py <<'TIO_HELPER_EOF'
+          from pathlib import Path
+          import hashlib
+          import sys
+          p=Path(sys.argv[1])/'official-addon/focus-edition/Addon.m'
+          s=p.read_text(encoding='utf-8')
+          assert hashlib.sha256(s.encode()).hexdigest()=='0e2e28ca25caa42d984d6fc75a04faa9800e1e44cce62b0c1252953e24fff5dd', 'Unexpected source revision; stop'
+          needle='static void AddEntry(void) {'
+          assert s.count(needle)==1
+          extra='''
+          // Local acceptance UI: no credential logging and no OTA authorization.
+          @interface TIOLoadStatusTarget : NSObject
+          + (void)show;
+          @end
+          @implementation TIOLoadStatusTarget
+          + (void)show {
+              UIViewController *top=TopController(); if(!top)return;
+              NSString *message=[NSString stringWithFormat:@"FOCUS-DIAG-20261013\\nBundle: %@\\nExpected: %@\\nHost match: %d\\nHooks: %d\\n%@\\nOTA flash: disabled in this build",NSBundle.mainBundle.bundleIdentifier,TargetBundle,VersionMatches(),HooksReady,Diagnostic];
+              UIAlertController *a=[UIAlertController alertControllerWithTitle:@"V2 加载检查" message:message preferredStyle:UIAlertControllerStyleAlert];
+              if([NSBundle.mainBundle.bundleIdentifier isEqual:TargetBundle] && Controller){
+                  [a addAction:[UIAlertAction actionWithTitle:@"打开 TurboIO" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action){[TIOEntryTarget show];}]];
+              }
+              [a addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleCancel handler:nil]];
+              [top presentViewController:a animated:YES completion:nil];
+          }
+          @end
+          static void TIOAttachLoadStatus(void) {
+              UIViewController *top=TopController();UIWindow *window=top.view.window;if(!window)return;
+              static UIButton *status;
+              if(!status){status=[UIButton buttonWithType:UIButtonTypeSystem];[status setTitle:@"V2 检查" forState:UIControlStateNormal];status.accessibilityLabel=@"FOCUS-DIAG-20261013";status.backgroundColor=UIColor.systemBlueColor;[status setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];status.layer.cornerRadius=16;[status addTarget:TIOLoadStatusTarget.class action:@selector(show) forControlEvents:UIControlEventTouchUpInside];}
+              status.frame=CGRectMake(MAX(8,window.bounds.size.width-94),window.safeAreaInsets.top+132,86,36);[window addSubview:status];
+          }
+          '''
+          s=s.replace(needle,extra+'\n'+needle)
+          needle='static void AddEntry(void) {\n    UIViewController *top=TopController();UIWindow *window=top.view.window;if(!window)return;'
+          assert s.count(needle)==1
+          s=s.replace(needle,needle+'\n    TIOAttachLoadStatus();\n')
+          needle='if(![NSBundle.mainBundle.bundleIdentifier isEqual:TargetBundle])return;'
+          assert s.count(needle)==1
+          s=s.replace(needle,'''NSString *early=[NSString stringWithFormat:@"FOCUS-DIAG-20261013 constructor reached; actual=%@; expected=%@",NSBundle.mainBundle.bundleIdentifier,TargetBundle];
+                      [early writeToFile:[NSTemporaryDirectory() stringByAppendingPathComponent:@"TurboIOPrivateAddon-early.txt"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+                      // Diagnostics remain reachable on an unexpected re-signing Bundle ID.
+                      for(int seconds=2;seconds<=10;seconds+=2){
+                          dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)seconds*NSEC_PER_SEC),dispatch_get_main_queue(),^{TIOAttachLoadStatus();});
+                      }
+                      [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n){TIOAttachLoadStatus();}];
+                      if(![NSBundle.mainBundle.bundleIdentifier isEqual:TargetBundle]){Diagnostic=@"签名后的包名与编译目标不一致；业务回调未接管";return;}
+                      ''')
+          needle='dispatch_after(dispatch_time(DISPATCH_TIME_NOW,2*NSEC_PER_SEC),dispatch_get_main_queue(),^{AddEntry();});'
+          assert s.count(needle)==1
+          s=s.replace(needle,needle+'\n            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,5*NSEC_PER_SEC),dispatch_get_main_queue(),^{AddEntry();});\n            dispatch_after(dispatch_time(DISPATCH_TIME_NOW,10*NSEC_PER_SEC),dispatch_get_main_queue(),^{AddEntry();});')
+          p.write_text(s,encoding='utf-8')
+          print('Applied bounded startup retries and visible diagnostic entry; preserved ABI and bundle gates.')
+          TIO_HELPER_EOF
+          cat > control/audit_ipa.py <<'TIO_HELPER_EOF'
+          import zipfile,plistlib,struct,hashlib,json,sys,uuid
+          from pathlib import Path
+          def macho(b):
+           if b[:4]!=b'\xcf\xfa\xed\xfe': return {'error':'not thin little endian Mach-O64'}
+           n,size=struct.unpack_from('<II',b,16)
+           if n>1024 or 32+size>len(b): raise ValueError('invalid Mach-O header bounds')
+           off=32; out={'cpu_type':hex(struct.unpack_from('<I',b,4)[0]),'file_type':struct.unpack_from('<I',b,12)[0],'loads':[],'rpaths':[],'uuid':None,'encryption':None,'code_signature':False,'chained_fixups':False}
+           for _ in range(n):
+            cmd,sz=struct.unpack_from('<II',b,off)
+            if sz<8 or off+sz>32+size: raise ValueError('invalid load command')
+            if cmd in (0xc,0x80000018,0x8000001f,0x80000023,0x20,0xd):
+             no=struct.unpack_from('<I',b,off+8)[0]; s=b[off+no:off+sz].split(b'\0')[0].decode()
+             out['loads'].append({'command':hex(cmd),'path':s})
+            if cmd==0x8000001c:
+             no=struct.unpack_from('<I',b,off+8)[0];out['rpaths'].append(b[off+no:off+sz].split(b'\0')[0].decode())
+            if cmd==0x1b:out['uuid']=uuid.UUID(bytes=b[off+8:off+24]).hex
+            if cmd in (0x21,0x2c):out['encryption']=struct.unpack_from('<III',b,off+8)[2]
+            if cmd==0x1d:out['code_signature']=True
+            if cmd==0x80000034:out['chained_fixups']=True
+            off+=sz
+           out['target_ids']=[s for s in ['io.turboio.venus.pub','com.rayneo.venus.pub'] if s.encode() in b]
+           out['feature_markers']=[s for s in ['TIOFocus','TFFocusConsume','FocusTransport','TFP1','TIOHome','TurboIO','TIOOTA','FOCUS-DIAG-20261013'] if s.encode() in b]
+           return out
+          def audit(p):
+           with zipfile.ZipFile(p) as z:
+            bad=z.testzip(); names=z.namelist(); root='Payload/Runner.app/'; info=plistlib.loads(z.read(root+'Info.plist'));exe=info['CFBundleExecutable']
+            out={'file':str(p),'size':Path(p).stat().st_size,'sha256':hashlib.file_digest(open(p,'rb'),'sha256').hexdigest(),'zip_crc_error':bad,'identity':{k:info.get(k) for k in ['CFBundleIdentifier','CFBundleShortVersionString','CFBundleVersion','CFBundleExecutable','MinimumOSVersion','UISupportedDevices','UIBackgroundModes']},'runner':macho(z.read(root+exe)),'addon_files':[],'art_files':[s for s in names if 'TurboIOArt/' in s],'provisioning_profile_present':root+'embedded.mobileprovision' in names}
+            for s in names:
+             if 'TurboIO' in s and s.endswith('.dylib'):
+              b=z.read(s);out['addon_files'].append({'path':s,'size':len(b),'sha256':hashlib.sha256(b).hexdigest(),'macho':macho(b)})
+            out['runner_loads_addon']=any('TurboIOPrivateAddon.dylib' in x['path'] for x in out['runner']['loads'])
+            return out
+          if __name__=='__main__':
+           r=audit(sys.argv[1]); text=json.dumps(r,ensure_ascii=False,indent=2);Path(sys.argv[2]).write_text(text,encoding='utf-8');print(text)
+          TIO_HELPER_EOF
+      - name: Build correct FOCUS edition with OTA disabled
+        working-directory: source
+        env:
+          TIO_CLASSIC_BINDINGS: '1'
+          TIO_OTA_FLASH_ENABLED: '0'
+          TIO_OTA_PREPARATION_ENABLED: '0'
+          TIO_AMAP_ENABLED: '0'
+        run: |
+          set -euo pipefail
+          python3 ../control/patch_focus_diagnostics.py "$PWD"
+          bash official-addon/focus-edition/build.sh embedded "$BUNDLE_ID"
+          ADDON="$PWD/official-addon/focus-edition/build/embedded/TurboIOPrivateAddon.dylib"
+          nm -g "$ADDON" > ../symbols.txt
+          grep -q '_TFFocusConsume' ../symbols.txt
+          strings "$ADDON" > ../addon-strings.txt
+          grep -q 'FOCUS-DIAG-20261013' ../addon-strings.txt
+          otool -L "$ADDON" > ../addon-loads.txt
+          otool -l "$ADDON" > ../addon-commands.txt
+          if grep -q LC_DYLD_CHAINED_FIXUPS ../addon-commands.txt; then exit 1; fi
+      - name: Download exact compatible host
+        run: |
+          set -euo pipefail
+          curl -fL --retry 3 -o host.ipa https://github.com/Turbo1123/Turbo-IO/releases/download/rayneo-ios-1.0.5-201/RayNeo_AI_1.0.5_201_decrypted_original.ipa
+          echo '39d12aff8f2b312dc3b40ce784a444e52c536e61378434005255177548df966a  host.ipa' | shasum -a 256 -c -
+          unzip -q host.ipa -d host
+      - name: Embed and copy FOCUS resources
+        run: |
+          set -euo pipefail
+          node source/official-addon/macho-embed.mjs "$PWD/host/Payload/Runner.app" "$PWD/out/Payload/Runner.app" "$PWD/source/official-addon/focus-edition/build/embedded/TurboIOPrivateAddon.dylib" "$BUNDLE_ID"
+          cp -R source/official-addon/focus-edition/TurboIOArt out/Payload/Runner.app/TurboIOArt
+          python3 - <<'PY'
+          import os,plistlib,pathlib
+          p=pathlib.Path('out/Payload/Runner.app/Info.plist')
+          d=plistlib.loads(p.read_bytes())
+          assert d['CFBundleIdentifier']==os.environ['BUNDLE_ID']
+          d.pop('UISupportedDevices',None)
+          # Signing-service entitlement decisions still require an actual signed-package check.
+          d['UIBackgroundModes']=[x for x in d.get('UIBackgroundModes',[]) if x!='remote-notification']
+          d['CFBundleDisplayName']='TurboIO V2 Check'
+          d['TurboIOBuild']='FOCUS-DIAG-20261013'
+          p.write_bytes(plistlib.dumps(d))
+          PY
+          # Remove obsolete vendor signatures; this is an explicitly unsigned artifact.
+          find out/Payload/Runner.app -type d -name _CodeSignature -prune -exec rm -rf {} +
+          find out/Payload/Runner.app -type f -name embedded.mobileprovision -delete
+          python3 - <<'PY'
+          import pathlib,subprocess,sys
+          sys.path.insert(0,'control')
+          from audit_ipa import macho
+          for p in pathlib.Path('out/Payload/Runner.app').rglob('*'):
+              if p.is_file():
+                  with p.open('rb') as f: magic=f.read(4)
+                  if magic==bytes.fromhex('cffaedfe') and macho(p.read_bytes())['code_signature']:
+                      subprocess.run(['codesign','--remove-signature',str(p)],check=True)
+          PY
+          otool -L out/Payload/Runner.app/Runner | tee runner-loads.txt
+          grep -q '@executable_path/Frameworks/TurboIOPrivateAddon.dylib' runner-loads.txt
+          ditto -c -k --norsrc --noextattr --keepParent out/Payload TurboIO-FOCUS-diagnostic-UNSIGNED.ipa
+          python3 control/audit_ipa.py TurboIO-FOCUS-diagnostic-UNSIGNED.ipa IPA-audit.json > /dev/null
+          python3 - <<'PY'
+          import json
+          d=json.load(open('IPA-audit.json'))
+          assert d['runner_loads_addon'] and not d['zip_crc_error'] and d['art_files']
+          assert d['runner']['uuid']=='748fd301da603095a2449bd0558faca5'
+          assert d['runner']['cpu_type']=='0x100000c' and d['runner']['file_type']==2
+          a=d['addon_files'][0]['macho']
+          assert a['file_type']==6 and a['cpu_type']=='0x100000c'
+          assert 'FOCUS-DIAG-20261013' in a['feature_markers'] and 'TFFocusConsume' in a['feature_markers']
+          assert not d['provisioning_profile_present']
+          PY
+          shasum -a 256 TurboIO-FOCUS-diagnostic-UNSIGNED.ipa > SHA256SUMS.txt
+      - name: Prepare small replacement kit
+        run: |
+          mkdir -p kit
+          cp out/Payload/Runner.app/Frameworks/TurboIOPrivateAddon.dylib kit/
+          cp out/Payload/Runner.app/Info.plist kit/
+          cp -R out/Payload/Runner.app/TurboIOArt kit/
+          cp IPA-audit.json kit/
+          shasum -a 256 kit/TurboIOPrivateAddon.dylib kit/Info.plist > kit/SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TurboIO-FOCUS-small-kit
+          retention-days: 3
+          path: kit/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TurboIO-FOCUS-diagnostic-UNSIGNED
+          retention-days: 3
+          path: |
+            TurboIO-FOCUS-diagnostic-UNSIGNED.ipa
+            IPA-audit.json
+            SHA256SUMS.txt
+            runner-loads.txt
+            addon-loads.txt
+            addon-commands.txt
+            symbols.txt
